@@ -1,0 +1,325 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g., 2026.3.17)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: cfdns
+  # Cache key prefix
+  CACHE_KEY_PREFIX: ${{ github.workflow }}-${{ github.run_id }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate version format
+  # ---------------------------------------------------------------------------
+  validate-version:
+    name: Validate version format
+    runs-on: ubuntu-latest
+    outputs:
+      valid: ${{ steps.check.outputs.valid }}
+    steps:
+      - name: Validate version format (YYYY.M.D)
+        id: check
+        run: |
+          if [[ "${{ inputs.version }}" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]]; then
+            echo "valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "❌ Error: Version must be in YYYY.M.D format (e.g., 2026.3.16)" >&2
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # CI checks (fmt, lint, test, doc)
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI checks
+    needs: validate-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ env.CACHE_KEY_PREFIX }}-ci-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ env.CACHE_KEY_PREFIX }}-ci-
+            ${{ github.workflow }}-ci-
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Doc check
+        run: cargo doc --no-deps
+
+  # ---------------------------------------------------------------------------
+  # Windows (MSVC + GNU)
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows (${{ matrix.variant }})
+    needs: ci
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            variant: msvc
+          - target: x86_64-pc-windows-gnu
+            variant: gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: ${{ env.CACHE_KEY_PREFIX }}-windows-${{ matrix.target }}-${{ hashFiles('**\Cargo.lock') }}
+          restore-keys: |
+            ${{ env.CACHE_KEY_PREFIX }}-windows-${{ matrix.target }}-
+            ${{ env.CACHE_KEY_PREFIX }}-windows-
+            ${{ github.workflow }}-windows-
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          mkdir -p "${{ env.BINARY_NAME }}-v${{ inputs.version }}-windows-x86_64-${{ matrix.variant }}"
+          cp "${{ env.BINARY_NAME }}.exe" "${{ env.BINARY_NAME }}-v${{ inputs.version }}-windows-x86_64-${{ matrix.variant }}/"
+          7z a "../../../${{ env.BINARY_NAME }}-v${{ inputs.version }}-windows-x86_64-${{ matrix.variant }}.zip" "${{ env.BINARY_NAME }}-v${{ inputs.version }}-windows-x86_64-${{ matrix.variant }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.variant }}
+          path: "${{ env.BINARY_NAME }}-v${{ inputs.version }}-windows-x86_64-${{ matrix.variant }}.zip"
+
+  # ---------------------------------------------------------------------------
+  # Linux (musl) – all targets built with musl-cross toolchains
+  # ---------------------------------------------------------------------------
+  linux-musl:
+    name: Linux (${{ matrix.target }})
+    needs: ci
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - arm-unknown-linux-musleabi
+          - arm-unknown-linux-musleabihf
+          - armv7-unknown-linux-musleabi
+          - armv7-unknown-linux-musleabihf
+          - x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ env.CACHE_KEY_PREFIX }}-linux-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ env.CACHE_KEY_PREFIX }}-linux-${{ matrix.target }}-
+            ${{ env.CACHE_KEY_PREFIX }}-linux-
+            ${{ github.workflow }}-linux-
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Download and extract musl toolchain
+        run: |
+          mkdir -p musl-tools/${{ matrix.target }}
+          echo "Downloading https://github.com/cross-tools/musl-cross/releases/download/20250929/${{ matrix.target }}.tar.xz"
+          curl -L "https://github.com/cross-tools/musl-cross/releases/download/20250929/${{ matrix.target }}.tar.xz" | \
+            tar xJ -C musl-tools/${{ matrix.target }} --strip-components=1
+          
+          echo "✅ Extracted musl toolchain for ${{ matrix.target }}"
+          
+      - name: Debug - List extracted musl tools
+        run: |
+          echo "📁 Contents of musl-tools/${{ matrix.target }}/bin:"
+          ls -la musl-tools/${{ matrix.target }}/bin/
+          
+          echo ""
+          echo "🔍 Looking for gcc binaries:"
+          find musl-tools/${{ matrix.target }} -name "*gcc*" -type f | sort
+          
+          echo ""
+          echo "🔍 Looking for ar binaries:"
+          find musl-tools/${{ matrix.target }} -name "*ar*" -type f | sort
+
+      - name: Set up toolchain environment
+        run: |
+          TOOLCHAIN_DIR="$PWD/musl-tools/${{ matrix.target }}"
+          echo "$TOOLCHAIN_DIR/bin" >> $GITHUB_PATH
+          
+          echo "📌 TOOLCHAIN_DIR: $TOOLCHAIN_DIR"
+          echo "📌 Added to PATH: $TOOLCHAIN_DIR/bin"
+          
+          # Find the compiler and set environment variables for cargo
+          if [ -d "$TOOLCHAIN_DIR/bin" ]; then
+            # Find the main compiler binary (gcc)
+            COMPILER=$(find "$TOOLCHAIN_DIR/bin" -name "*gcc" -type f | head -1)
+            if [ -n "$COMPILER" ]; then
+              COMPILER_NAME=$(basename "$COMPILER")
+              echo "✅ Found compiler: $COMPILER_NAME"
+              
+              # Extract prefix (remove -gcc suffix)
+              TOOLCHAIN_PREFIX=${COMPILER_NAME%-gcc}
+              echo "📌 Detected toolchain prefix: $TOOLCHAIN_PREFIX"
+              
+              # Convert target triple to uppercase and underscore for environment variable names
+              TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr - _)
+              
+              # Set environment variables directly without indirection
+              echo "CC_$TARGET_UPPER=$TOOLCHAIN_PREFIX-gcc" >> $GITHUB_ENV
+              echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=$TOOLCHAIN_PREFIX-gcc" >> $GITHUB_ENV
+              
+              echo "📌 Set CC_$TARGET_UPPER=$TOOLCHAIN_PREFIX-gcc"
+              echo "📌 Set CARGO_TARGET_${TARGET_UPPER}_LINKER=$TOOLCHAIN_PREFIX-gcc"
+            else
+              echo "❌ Could not find gcc compiler in $TOOLCHAIN_DIR/bin"
+              exit 1
+            fi
+          else
+            echo "❌ No bin directory found in $TOOLCHAIN_DIR"
+            exit 1
+          fi
+
+      - name: Verify toolchain and linker
+        run: |
+          echo "🔍 Verifying toolchain accessibility:"
+          TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr - _)
+          
+          # Use printenv to safely get environment variable values
+          CC_VAL=$(printenv "CC_$TARGET_UPPER")
+          LINKER_VAL=$(printenv "CARGO_TARGET_${TARGET_UPPER}_LINKER")
+          
+          echo "CC: $CC_VAL"
+          echo "Linker: $LINKER_VAL"
+          
+          echo ""
+          echo "🔍 Checking if compilers are in PATH:"
+          which $CC_VAL || echo "❌ $CC_VAL not found in PATH"
+          
+          echo ""
+          echo "🔍 Testing compiler:"
+          $CC_VAL --version || echo "❌ Failed to run compiler"
+          
+          echo ""
+          echo "🔍 Testing linker:"
+          $LINKER_VAL --version || echo "❌ Failed to run linker"
+
+      - name: Create cargo config for target
+        run: |
+          mkdir -p .cargo
+          TARGET_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr - _)
+          
+          # Get environment variable values safely
+          CC_VAL=$(printenv "CC_$TARGET_UPPER")
+          LINKER_VAL=$(printenv "CARGO_TARGET_${TARGET_UPPER}_LINKER")
+          
+          cat > .cargo/config.toml << EOF
+          [target.${{ matrix.target }}]
+          linker = "${LINKER_VAL}"
+          ar = "${CC_VAL}"
+          EOF
+          
+          echo "✅ Created .cargo/config.toml with linker configuration"
+          cat .cargo/config.toml
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ -f "${{ env.BINARY_NAME }}" ]; then
+            tar -czf "${{ github.workspace }}/${{ env.BINARY_NAME }}-v${{ inputs.version }}-${{ matrix.target }}.tar.gz" "${{ env.BINARY_NAME }}"
+          else
+            echo "❌ Binary not found!"
+            ls -la
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: "${{ env.BINARY_NAME }}-v${{ inputs.version }}-${{ matrix.target }}.tar.gz"
+
+  # ---------------------------------------------------------------------------
+  # Create GitHub Release
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create Release
+    needs: [windows, linux-musl]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          for file in *; do
+            if [ -f "$file" ]; then
+              sha256sum "$file" >> SHA256SUMS.txt
+            fi
+          done
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          generate_release_notes: true
+          files: |
+            artifacts/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

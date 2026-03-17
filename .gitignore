@@ -1,0 +1,49 @@
+# Rust build artifacts
+target
+debug
+
+# rustfmt backup files
+**/*.rs.bk
+
+# rustc MSVC Windows builds 
+*.pdb
+
+# cargo mutants
+**/mutants.out*/
+
+# some IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Log files
+*.log
+logs
+
+# Temporary files
+tmp
+temp
+*.tmp
+
+# Backup files
+*.bak
+*.backup
+
+# Archive files
+*.tar.gz
+*.tar.zstd
+*.tar.xz
+*.zip
+*.7z
+*.gz
+*.rar
+
+# Local development files
+local
+dev
